@@ -1,258 +1,99 @@
-const json = (data, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*",
-    },
-  });
+const json=(data,status=200,extra={})=>new Response(JSON.stringify(data),{status,headers:{"content-type":"application/json; charset=utf-8","access-control-allow-origin":"*",...extra}});
+const now=()=>new Date().toISOString();
+const rand=(n=24)=>{const a=new Uint8Array(n);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")};
+const id=p=>`${p}_${rand(10)}`;
+const hash=async s=>[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)))].map(x=>x.toString(16).padStart(2,"0")).join("");
+const pad=n=>String(n).padStart(2,"0");
 
-const now = () => new Date().toISOString();
-
-const randomHex = (bytes = 24) => {
-  const a = new Uint8Array(bytes);
-  crypto.getRandomValues(a);
-  return [...a].map((x) => x.toString(16).padStart(2, "0")).join("");
-};
-
-const makeId = (prefix) => `${prefix}_${randomHex(10)}`;
-
-const randomCode = () => {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const a = new Uint8Array(6);
-  crypto.getRandomValues(a);
-  return [...a].map((x) => chars[x % chars.length]).join("");
-};
-
-const hash = async (text) => {
-  const buf = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(text)
-  );
-  return [...new Uint8Array(buf)]
-    .map((x) => x.toString(16).padStart(2, "0"))
-    .join("");
-};
-
-async function auth(request, env) {
-  const token = (request.headers.get("authorization") || "").replace(
-    /^Bearer\s+/i,
-    ""
-  );
-
-  if (!token) return null;
-
-  const tokenHash = await hash(token);
-
-  return env.DB.prepare(`
-    SELECT
-      m.*,
-      f.join_code,
-      f.timezone
-    FROM members m
-    JOIN families f ON f.id = m.family_id
-    WHERE m.token_hash = ?
-  `)
-    .bind(tokenHash)
-    .first();
+async function auth(req,env){
+  const raw=(req.headers.get("authorization")||"").replace(/^Bearer\s+/i,"");if(!raw)return null;
+  const h=await hash(raw);return env.DB.prepare("SELECT m.*, f.join_code, f.timezone FROM members m JOIN families f ON f.id=m.family_id WHERE m.token_hash=?").bind(h).first()
 }
+function localParts(tz){
+  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",weekday:"short",hour:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
+  const o={};parts.forEach(p=>o[p.type]=p.value);return {date:`${o.year}-${o.month}-${o.day}`,hour:Number(o.hour),weekday:o.weekday}
+}
+const parseDate=s=>new Date(`${s}T12:00:00Z`);
+const iso=d=>`${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
+const addDays=(s,n)=>{const d=parseDate(s);d.setUTCDate(d.getUTCDate()+n);return iso(d)}
+const lastDay=(y,m)=>new Date(Date.UTC(y,m,0)).getUTCDate();
+const monthly=(y,m,day)=>`${y}-${pad(m)}-${pad(Math.min(Number(day||1),lastDay(y,m)))}`;
+function occurrences(b,from,to){
+  if(!b.active&& !b.endedAt)return [];let out=[];
+  if(b.frequency==="one"){if(b.dueDate>=from&&b.dueDate<=to)out=[b.dueDate]}
+  else if(b.frequency==="weekly"){let d=b.startDate||from;while(d<from)d=addDays(d,7);while(d<=to){out.push(d);d=addDays(d,7)}}
+  else {let d=parseDate(from),e=parseDate(to);d.setUTCDate(1);while(d<=e){const s=monthly(d.getUTCFullYear(),d.getUTCMonth()+1,b.dueDay);if(s>=from&&s<=to)out.push(s);d.setUTCMonth(d.getUTCMonth()+1)}}
+  if(b.endedAt)out=out.filter(x=>x<=b.endedAt);return out
+}
+async function sendPush(env,memberIds,title,message,url="/"){
+  if(!env.ONESIGNAL_APP_ID||!env.ONESIGNAL_REST_API_KEY||!memberIds.length)return false;
+  const r=await fetch("https://api.onesignal.com/notifications",{method:"POST",headers:{"content-type":"application/json","authorization":`Key ${env.ONESIGNAL_REST_API_KEY}`},body:JSON.stringify({app_id:env.ONESIGNAL_APP_ID,include_aliases:{external_id:memberIds},target_channel:"push",headings:{fr:title,en:title},contents:{fr:message,en:message},url:env.APP_URL||url})});
+  return r.ok
+}
+async function logOnce(env,familyId,key,fn){
+  const found=await env.DB.prepare("SELECT id FROM reminder_log WHERE reminder_key=?").bind(key).first();if(found)return;
+  const ok=await fn();if(ok)await env.DB.prepare("INSERT OR IGNORE INTO reminder_log(id,family_id,reminder_key,sent_at) VALUES(?,?,?,?)").bind(id("rem"),familyId,key,now()).run()
+}
+async function processFamily(env,f){
+  let data={};try{data=JSON.parse(f.data_json||"{}")}catch{return}
+  const s=data.settings||{},p=localParts(f.timezone||s.timezone||"America/Toronto"),hour=Number(s.reminderHour??9);
+  if(p.hour!==hour)return;
+  const members=await env.DB.prepare("SELECT id FROM members WHERE family_id=?").bind(f.id).all(), ids=(members.results||[]).map(x=>x.id);
+  const bills=(data.bills||[]).filter(b=>b.active!==false), from=addDays(p.date,-3650),to=addDays(p.date,8), items=[];
+  bills.forEach(b=>occurrences(b,from,to).forEach(due=>items.push({b,due,st:(b.statuses||{})[due]||{}})));
 
+  if(s.sundayReminder!==false && p.weekday==="Sun"){
+    const upcoming=items.filter(x=>x.due>=p.date&&x.due<=addDays(p.date,7)&&!x.st.paidAt);
+    if(upcoming.length){
+      const total=upcoming.reduce((a,x)=>a+Number(x.b.amount||0),0), names=upcoming.slice(0,4).map(x=>x.b.name).join(", ");
+      await logOnce(env,f.id,`${f.id}:weekly:${p.date}`,()=>sendPush(env,ids,"BUDGET PACK · Semaine",`${upcoming.length} paiement(s) à venir · ${total.toFixed(2)} $ · ${names}${upcoming.length>4?"…":""}`))
+    }
+  }
+  for(const x of items){
+    if(x.st.paidAt)continue;
+    if(x.st.snoozedUntil && x.st.snoozedUntil>p.date)continue;
+    if(s.dayBeforeReminder!==false && x.due===addDays(p.date,1)){
+      await logOnce(env,f.id,`${f.id}:tomorrow:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement demain",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ demain.`))
+    }
+    if(s.lateReminder!==false && x.due<p.date){
+      await logOnce(env,f.id,`${f.id}:late:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement en retard",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ n'est pas marqué payé.`,env.APP_URL||"/"))
+    }
+  }
+}
 export default {
-  async fetch(request, env) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "access-control-allow-origin": "*",
-          "access-control-allow-headers": "authorization,content-type",
-          "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
-        },
-      });
-    }
-
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    try {
-      if (path === "/" || path === "/api/health") {
-        return json({
-          ok: true,
-          service: "BUDGET PACK API",
-          time: now(),
-        });
-      }
-
-      if (path === "/api/family/create" && request.method === "POST") {
-        const body = await request.json();
-
-        const familyId = makeId("fam");
-        const memberId = makeId("mem");
-        const token = randomHex(24);
-        const joinCode = randomCode();
-        const time = now();
-
+  async fetch(req,env){
+    if(req.method==="OPTIONS")return new Response(null,{headers:{"access-control-allow-origin":"*","access-control-allow-headers":"authorization,content-type","access-control-allow-methods":"GET,POST,PUT,OPTIONS"}});
+    const u=new URL(req.url),path=u.pathname;
+    try{
+      if(path==="/api/health")return json({ok:true,time:now()});
+      if(path==="/api/family/create"&&req.method==="POST"){
+        const b=await req.json(),familyId=id("fam"),memberId=id("mem"),token=rand(24),joinCode=Math.random().toString(36).slice(2,8).toUpperCase(),t=now();
         await env.DB.batch([
-          env.DB.prepare(`
-            INSERT INTO families
-            (id,name,join_code,timezone,data_json,version,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?)
-          `).bind(
-            familyId,
-            body.familyName || "Budget familial",
-            joinCode,
-            body.timezone || "America/Toronto",
-            "{}",
-            0,
-            time,
-            time
-          ),
-
-          env.DB.prepare(`
-            INSERT INTO members
-            (id,family_id,name,role,token_hash,created_at)
-            VALUES (?,?,?,?,?,?)
-          `).bind(
-            memberId,
-            familyId,
-            body.memberName || "Moi",
-            "owner",
-            await hash(token),
-            time
-          ),
+          env.DB.prepare("INSERT INTO families(id,name,join_code,timezone,data_json,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").bind(familyId,b.familyName||"Budget familial",joinCode,b.timezone||"America/Toronto","{}",0,t,t),
+          env.DB.prepare("INSERT INTO members(id,family_id,name,role,token_hash,created_at) VALUES(?,?,?,?,?,?)").bind(memberId,familyId,b.memberName||"Moi","owner",await hash(token),t)
         ]);
-
-        return json({
-          familyId,
-          memberId,
-          token,
-          joinCode,
-          version: 0,
-        });
+        return json({familyId,memberId,token,joinCode,version:0})
       }
-
-      if (path === "/api/family/join" && request.method === "POST") {
-        const body = await request.json();
-
-        const family = await env.DB.prepare(`
-          SELECT * FROM families WHERE join_code = ?
-        `)
-          .bind(String(body.joinCode || "").trim().toUpperCase())
-          .first();
-
-        if (!family) {
-          return json({ error: "Code famille introuvable" }, 404);
-        }
-
-        const memberId = makeId("mem");
-        const token = randomHex(24);
-
-        await env.DB.prepare(`
-          INSERT INTO members
-          (id,family_id,name,role,token_hash,created_at)
-          VALUES (?,?,?,?,?,?)
-        `)
-          .bind(
-            memberId,
-            family.id,
-            body.memberName || "Membre",
-            "member",
-            await hash(token),
-            now()
-          )
-          .run();
-
-        return json({
-          familyId: family.id,
-          memberId,
-          token,
-          joinCode: family.join_code,
-        });
+      if(path==="/api/family/join"&&req.method==="POST"){
+        const b=await req.json(),f=await env.DB.prepare("SELECT * FROM families WHERE join_code=?").bind(String(b.joinCode||"").toUpperCase()).first();if(!f)return json({error:"Code famille introuvable"},404);
+        const memberId=id("mem"),token=rand(24);await env.DB.prepare("INSERT INTO members(id,family_id,name,role,token_hash,created_at) VALUES(?,?,?,?,?,?)").bind(memberId,f.id,b.memberName||"Membre","member",await hash(token),now()).run();
+        return json({familyId:f.id,memberId,token,joinCode:f.join_code})
       }
-
-      const member = await auth(request, env);
-
-      if (!member) {
-        return json({ error: "Non autorisé" }, 401);
+      const me=await auth(req,env);if(!me)return json({error:"Non autorisé"},401);
+      if(path==="/api/state"&&req.method==="GET"){
+        const f=await env.DB.prepare("SELECT data_json,version,updated_at FROM families WHERE id=?").bind(me.family_id).first();return json({data:JSON.parse(f.data_json||"{}"),version:f.version,updatedAt:f.updated_at,joinCode:me.join_code})
       }
-
-      if (path === "/api/state" && request.method === "GET") {
-        const family = await env.DB.prepare(`
-          SELECT data_json, version, updated_at
-          FROM families
-          WHERE id = ?
-        `)
-          .bind(member.family_id)
-          .first();
-
-        return json({
-          data: JSON.parse(family.data_json || "{}"),
-          version: family.version,
-          updatedAt: family.updated_at,
-          joinCode: member.join_code,
-        });
+      if(path==="/api/state"&&req.method==="PUT"){
+        const b=await req.json(),f=await env.DB.prepare("SELECT data_json,version FROM families WHERE id=?").bind(me.family_id).first();
+        if(Number(b.version)!==Number(f.version))return json({error:"Conflit de synchronisation",data:JSON.parse(f.data_json||"{}"),version:f.version},409);
+        const v=Number(f.version)+1,t=now();await env.DB.prepare("UPDATE families SET data_json=?,version=?,updated_at=? WHERE id=?").bind(JSON.stringify(b.data||{}),v,t,me.family_id).run();return json({ok:true,version:v,updatedAt:t})
       }
-
-      if (path === "/api/state" && request.method === "PUT") {
-        const body = await request.json();
-
-        const family = await env.DB.prepare(`
-          SELECT data_json, version
-          FROM families
-          WHERE id = ?
-        `)
-          .bind(member.family_id)
-          .first();
-
-        if (Number(body.version) !== Number(family.version)) {
-          return json(
-            {
-              error: "Conflit de synchronisation",
-              data: JSON.parse(family.data_json || "{}"),
-              version: family.version,
-            },
-            409
-          );
-        }
-
-        const nextVersion = Number(family.version) + 1;
-        const time = now();
-
-        await env.DB.prepare(`
-          UPDATE families
-          SET data_json = ?, version = ?, updated_at = ?
-          WHERE id = ?
-        `)
-          .bind(
-            JSON.stringify(body.data || {}),
-            nextVersion,
-            time,
-            member.family_id
-          )
-          .run();
-
-        return json({
-          ok: true,
-          version: nextVersion,
-          updatedAt: time,
-        });
-      }
-
-      if (path === "/api/me" && request.method === "GET") {
-        return json({
-          memberId: member.id,
-          memberName: member.name,
-          familyId: member.family_id,
-          joinCode: member.join_code,
-        });
-      }
-
-      return json({ error: "Route introuvable" }, 404);
-    } catch (error) {
-      return json(
-        {
-          error: error?.message || "Erreur serveur",
-        },
-        500
-      );
-    }
+      if(path==="/api/me"&&req.method==="GET")return json({memberId:me.id,memberName:me.name,familyId:me.family_id,joinCode:me.join_code});
+      return json({error:"Route introuvable"},404)
+    }catch(e){return json({error:e.message||"Erreur serveur"},500)}
   },
+  async scheduled(controller,env,ctx){
+    const fam=await env.DB.prepare("SELECT * FROM families").all();
+    for(const f of fam.results||[])ctx.waitUntil(processFamily(env,f))
+  }
 };
