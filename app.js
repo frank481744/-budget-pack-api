@@ -1,5 +1,6 @@
 (() => {
 "use strict";
+const BUDGET_PACK_BUILD="2026-09-27-FIX160-V3";
 // BUDGET PACK FIX DOUBLONS V2 — 2026-09-27
 const LS_KEY="budgetPackStateV1", PROFILE_KEY="budgetPackProfileV1", THEME_KEY="budgetPackThemeV1";
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -382,9 +383,11 @@ function renderSettings(){
   const cb=state.settings.categoryBudgets||{};$("#categoryBudgetList").innerHTML=Object.keys(cb).length?Object.entries(cb).map(([k,v])=>`<div class="billRow"><div class="billMain"><div class="billTitle">${esc(k)}</div><div class="sub">Budget mensuel</div></div><div class="amount">${money(v)}</div><div class="rowActions"><button onclick="BP.removeCategoryBudget('${encodeURIComponent(k)}')">✕</button></div></div>`).join(""):`<div class="muted small">Aucun budget mensuel supplémentaire.</div>`;
   $("#cloudStatus").innerHTML=profile.token?`✅ Connecté comme <b>${esc(profile.memberName||"membre")}</b><br>Code famille : <b>${esc(profile.joinCode||"—")}</b>`:`Pas encore connecté — l'app fonctionne localement.`;
   ensureBalanceTools();
+  ensureOctCleanupButton();
 }
 function updateSyncLine(){
-  $("#syncLine").textContent=profile.token?`Budget partagé · ${profile.memberName||"connecté"}`:"Mode local · prêt à utiliser";
+  const build="FIX160-V3";
+  $("#syncLine").textContent=profile.token?`Budget partagé · ${profile.memberName||"connecté"} · ${build}`:`Mode local · ${build}`;
 }
 
 function openModal(html){$("#modal").innerHTML=html;$("#modalBackdrop").classList.remove("hidden")}
@@ -566,13 +569,16 @@ async function pullCloud(){
     const j=await api("/api/state");
     if(j.data&&j.data.settings){
       state=mergeState(state,j.data);
-      // Nettoie aussi les anciens doublons qui peuvent revenir du budget partagé.
-      migrateLegacyPlanRetards();
-      migrateOct2026CombinedRemainders();
+      // Nettoie les anciens doublons AVANT d'afficher le budget partagé.
+      const cleaned=!!(migrateLegacyPlanRetards()|migrateOct2026CombinedRemainders());
       migrateMonthlyPlansToOperational();
-      profile.cloudVersion=j.version||0;saveProfile();localStorage.setItem(LS_KEY,JSON.stringify(state));render();await pushCloud(true)
+      profile.cloudVersion=j.version||0;saveProfile();
+      localStorage.setItem(LS_KEY,JSON.stringify(state));
+      render();
+      // saveState planifie un push après 650 ms; à ce moment cloudBusy sera libéré.
+      if(cleaned){clearTimeout(cloudTimer);cloudTimer=setTimeout(()=>pushCloud(true),700)}
     }
-    else{profile.cloudVersion=j.version||0;saveProfile();await pushCloud(true)}
+    else{profile.cloudVersion=j.version||0;saveProfile()}
   }catch(e){console.warn(e)}finally{cloudBusy=false}
 }
 async function pushCloud(force=false){
@@ -927,6 +933,31 @@ function migrateOct2026CombinedRemainders(){
     localStorage.setItem(LS_KEY,JSON.stringify(state));
   }
   return changed;
+}
+
+function octRemainderDuplicateCount(){
+  const items=state.monthlyPlans?.["2026-10"]?.items||[];
+  const norm=v=>importName(v||"");
+  return items.filter(x=>x?.date==="2026-10-01"&&x.kind==="remaining"&&norm(x.label).includes("restant familial")&&Math.abs(Number(x.amount||0)+160)<0.01).length;
+}
+function cleanupOctRemaindersNow(){
+  const before=octRemainderDuplicateCount();
+  const changed=migrateOct2026CombinedRemainders();
+  const after=octRemainderDuplicateCount();
+  if(changed){saveState();toast(`Nettoyage fait ✅ ${before} → ${after} restant familial`)}
+  else toast(`Déjà propre ✅ ${after} restant familial`);
+}
+function ensureOctCleanupButton(){
+  const existing=document.getElementById("cleanupOctRemaindersBtn");
+  const count=octRemainderDuplicateCount();
+  if(count<=1){if(existing)existing.remove();return}
+  if(existing){existing.textContent=`🧹 Nettoyer les doublons -160 $ (${count})`;return}
+  const seed=document.getElementById("seedBtn");if(!seed||!seed.parentNode)return;
+  const btn=document.createElement("button");
+  btn.type="button";btn.id="cleanupOctRemaindersBtn";btn.className="fullBtn primary";
+  btn.style.marginBottom="10px";btn.textContent=`🧹 Nettoyer les doublons -160 $ (${count})`;
+  btn.onclick=cleanupOctRemaindersNow;
+  seed.parentNode.insertBefore(btn,seed);
 }
 
 // ----- Liaison automatique Budget du mois -> factures / paies -----
