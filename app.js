@@ -1,5 +1,6 @@
 (() => {
 "use strict";
+// BUDGET PACK FIX DOUBLONS V2 — 2026-09-27
 const LS_KEY="budgetPackStateV1", PROFILE_KEY="budgetPackProfileV1", THEME_KEY="budgetPackThemeV1";
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const pad=n=>String(n).padStart(2,"0");
@@ -563,7 +564,14 @@ async function pullCloud(){
   if(!profile.token||!apiBase()||cloudBusy)return;cloudBusy=true;
   try{
     const j=await api("/api/state");
-    if(j.data&&j.data.settings){state=mergeState(state,j.data);profile.cloudVersion=j.version||0;saveProfile();localStorage.setItem(LS_KEY,JSON.stringify(state));render();await pushCloud(true)}
+    if(j.data&&j.data.settings){
+      state=mergeState(state,j.data);
+      // Nettoie aussi les anciens doublons qui peuvent revenir du budget partagé.
+      migrateLegacyPlanRetards();
+      migrateOct2026CombinedRemainders();
+      migrateMonthlyPlansToOperational();
+      profile.cloudVersion=j.version||0;saveProfile();localStorage.setItem(LS_KEY,JSON.stringify(state));render();await pushCloud(true)
+    }
     else{profile.cloudVersion=j.version||0;saveProfile();await pushCloud(true)}
   }catch(e){console.warn(e)}finally{cloudBusy=false}
 }
@@ -572,7 +580,13 @@ async function pushCloud(force=false){
   try{
     const j=await api("/api/state",{method:"PUT",body:JSON.stringify({version:profile.cloudVersion||0,data:state})});profile.cloudVersion=j.version;saveProfile();$("#syncLine").textContent=`Synchronisé · ${profile.memberName||""}`;
   }catch(e){
-    if(e.status===409&&e.data?.data){state=mergeState(state,e.data.data);profile.cloudVersion=e.data.version;saveProfile();localStorage.setItem(LS_KEY,JSON.stringify(state));cloudBusy=false;return pushCloud(true)}
+    if(e.status===409&&e.data?.data){
+      state=mergeState(state,e.data.data);
+      migrateLegacyPlanRetards();
+      migrateOct2026CombinedRemainders();
+      migrateMonthlyPlansToOperational();
+      profile.cloudVersion=e.data.version;saveProfile();localStorage.setItem(LS_KEY,JSON.stringify(state));cloudBusy=false;return pushCloud(true)
+    }
     $("#syncLine").textContent="Sync à vérifier";console.warn(e)
   }finally{cloudBusy=false}
 }
