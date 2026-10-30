@@ -1,3 +1,4 @@
+// BUDGET PACK API — CALENDAR V3 RDV + RAPPELS (2026-10-30)
 const json=(data,status=200,extra={})=>new Response(JSON.stringify(data),{status,headers:{"content-type":"application/json; charset=utf-8","access-control-allow-origin":"*",...extra}});
 const now=()=>new Date().toISOString();
 const rand=(n=24)=>{const a=new Uint8Array(n);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")};
@@ -11,12 +12,12 @@ async function auth(req,env){
   const h=await hash(raw);return env.DB.prepare("SELECT m.*, f.join_code, f.timezone FROM members m JOIN families f ON f.id=m.family_id WHERE m.token_hash=?").bind(h).first()
 }
 function localParts(tz){
-  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",weekday:"short",hour:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
-  const o={};parts.forEach(p=>o[p.type]=p.value);return {date:`${o.year}-${o.month}-${o.day}`,hour:Number(o.hour),weekday:o.weekday}
+  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",weekday:"short",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
+  const o={};parts.forEach(p=>o[p.type]=p.value);return {date:`${o.year}-${o.month}-${o.day}`,hour:Number(o.hour),minute:Number(o.minute),weekday:o.weekday}
 }
 const parseDate=s=>new Date(`${s}T12:00:00Z`);
 const iso=d=>`${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
-const addDays=(s,n)=>{const d=parseDate(s);d.setUTCDate(d.getUTCDate()+n);return iso(d)}
+const addDays=(s,n)=>{const d=parseDate(s);d.setUTCDate(d.getUTCDate()+n);return iso(d)};
 const lastDay=(y,m)=>new Date(Date.UTC(y,m,0)).getUTCDate();
 const monthly=(y,m,day)=>`${y}-${pad(m)}-${pad(Math.min(Number(day||1),lastDay(y,m)))}`;
 function occurrences(b,from,to){
@@ -42,28 +43,88 @@ async function logOnce(env,familyId,key,fn){
   const found=await env.DB.prepare("SELECT id FROM reminder_log WHERE reminder_key=?").bind(key).first();if(found)return;
   const ok=await fn();if(ok)await env.DB.prepare("INSERT OR IGNORE INTO reminder_log(id,family_id,reminder_key,sent_at) VALUES(?,?,?,?)").bind(id("rem"),familyId,key,now()).run()
 }
+function isAppointment(b){
+  const c=String(b?.calendarKind||"").toLowerCase(),cat=String(b?.category||"").toLowerCase();
+  return c==="appointment"||cat==="rendez-vous"||cat==="rendez vous";
+}
+function reminderOffsetMinutes(code){
+  const v=String(code||"").trim().toLowerCase();
+  if(v==="1d")return 1440;
+  let m=v.match(/^(\d+)h$/);if(m)return Number(m[1])*60;
+  m=v.match(/^(\d+)m$/);if(m)return Number(m[1]);
+  return null;
+}
+function appointmentReminders(b,s){
+  if(Array.isArray(b?.reminderOffsets))return [...new Set(b.reminderOffsets.map(x=>String(x||"").toLowerCase()).filter(Boolean))];
+  return s.dayBeforeReminder===false?[]:["1d"];
+}
+function localMinutesUntil(p,due,time){
+  if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(time||"")))return null;
+  const current=Date.parse(`${p.date}T${pad(p.hour)}:${pad(p.minute)}:00Z`);
+  const event=Date.parse(`${due}T${time}:00Z`);
+  if(!Number.isFinite(current)||!Number.isFinite(event))return null;
+  return Math.round((event-current)/60000);
+}
+function appointmentMessage(b,due,prefix=""){
+  const bits=[];
+  if(b.eventTime)bits.push(String(b.eventTime).slice(0,5));
+  if(b.location)bits.push(String(b.location).slice(0,90));
+  if(b.note)bits.push(String(b.note).slice(0,140));
+  return `${prefix}${b.name}${bits.length?` · ${bits.join(" · ")}`:""}`;
+}
+function offsetLabel(code){
+  if(code==="2h")return "2 h";
+  if(code==="1h")return "1 h";
+  const h=String(code||"").match(/^(\d+)h$/);if(h)return `${h[1]} h`;
+  const m=String(code||"").match(/^(\d+)m$/);if(m)return `${m[1]} min`;
+  return code;
+}
 async function processFamily(env,f){
   let data={};try{data=JSON.parse(f.data_json||"{}")}catch{return}
-  const s=data.settings||{},p=localParts(f.timezone||s.timezone||"America/Toronto"),hour=Number(s.reminderHour??9);
-  if(p.hour!==hour)return;
+  const s=data.settings||{},p=localParts(f.timezone||s.timezone||"America/Toronto"),hour=Number(s.reminderHour??9),atReminderHour=p.hour===hour;
   const members=await env.DB.prepare("SELECT id FROM members WHERE family_id=?").bind(f.id).all(), ids=(members.results||[]).map(x=>x.id);
   const bills=(data.bills||[]).filter(b=>b.active!==false), from=addDays(p.date,-3650),to=addDays(p.date,8), items=[];
   bills.forEach(b=>occurrences(b,from,to).forEach(due=>items.push({b,due,st:(b.statuses||{})[due]||{}})));
 
-  if(s.sundayReminder!==false && p.weekday==="Sun"){
+  if(atReminderHour && s.sundayReminder!==false && p.weekday==="Sun"){
     const upcoming=items.filter(x=>x.due>=p.date&&x.due<=addDays(p.date,7)&&!x.st.paidAt);
+    const payments=upcoming.filter(x=>!isAppointment(x.b)), appointments=upcoming.filter(x=>isAppointment(x.b));
     if(upcoming.length){
-      const total=upcoming.reduce((a,x)=>a+Number(x.b.amount||0),0), names=upcoming.slice(0,4).map(x=>x.b.name).join(", ");
-      await logOnce(env,f.id,`${f.id}:weekly:${p.date}`,()=>sendPush(env,ids,"BUDGET PACK · Semaine",`${upcoming.length} paiement(s) à venir · ${total.toFixed(2)} $ · ${names}${upcoming.length>4?"…":""}`))
+      const total=payments.reduce((a,x)=>a+Number(x.b.amount||0),0), parts=[];
+      if(payments.length)parts.push(`${payments.length} paiement(s) · ${total.toFixed(2)} $`);
+      if(appointments.length)parts.push(`${appointments.length} rendez-vous`);
+      const names=upcoming.slice(0,4).map(x=>x.b.name).join(", ");
+      await logOnce(env,f.id,`${f.id}:weekly:${p.date}`,()=>sendPush(env,ids,"BUDGET PACK · Semaine",`${parts.join(" · ")} · ${names}${upcoming.length>4?"…":""}`))
     }
   }
+
   for(const x of items){
     if(x.st.paidAt)continue;
     if(x.st.snoozedUntil && x.st.snoozedUntil>p.date)continue;
-    if(s.dayBeforeReminder!==false && x.due===addDays(p.date,1)){
+
+    if(isAppointment(x.b)){
+      const reminders=appointmentReminders(x.b,s);
+      if(atReminderHour && reminders.includes("1d") && x.due===addDays(p.date,1)){
+        await logOnce(env,f.id,`${f.id}:rdv:1d:${x.b.id}:${x.due}`,()=>sendPush(env,ids,"Rendez-vous demain",appointmentMessage(x.b,x.due,"📅 ")))
+      }
+      if(x.b.eventTime){
+        const diff=localMinutesUntil(p,x.due,x.b.eventTime);
+        for(const code of reminders){
+          if(code==="1d")continue;
+          const offset=reminderOffsetMinutes(code);if(offset==null||offset<=0||diff==null)continue;
+          // Le cron existant est horaire : cette fenêtre envoie une fois, au passage le plus proche avant le rappel demandé.
+          if(diff>=offset && diff<offset+60){
+            await logOnce(env,f.id,`${f.id}:rdv:${code}:${x.b.id}:${x.due}`,()=>sendPush(env,ids,`Rendez-vous dans ~${offsetLabel(code)}`,appointmentMessage(x.b,x.due,"📅 ")))
+          }
+        }
+      }
+      continue;
+    }
+
+    if(atReminderHour && s.dayBeforeReminder!==false && x.due===addDays(p.date,1)){
       await logOnce(env,f.id,`${f.id}:tomorrow:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement demain",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ demain.`))
     }
-    if(s.lateReminder!==false && x.due<p.date){
+    if(atReminderHour && s.lateReminder!==false && x.due<p.date){
       await logOnce(env,f.id,`${f.id}:late:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement en retard",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ n'est pas marqué payé.`,env.APP_URL||"/"))
     }
   }
