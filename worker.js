@@ -1,4 +1,4 @@
-// BUDGET PACK API — CALENDAR V3 RDV + RAPPELS (2026-10-30)
+// BUDGET PACK API — CALENDAR V3 RDV + RAPPELS + SHARE DONE V2 (2026-10-31)
 const json=(data,status=200,extra={})=>new Response(JSON.stringify(data),{status,headers:{"content-type":"application/json; charset=utf-8","access-control-allow-origin":"*",...extra}});
 const now=()=>new Date().toISOString();
 const rand=(n=24)=>{const a=new Uint8Array(n);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")};
@@ -79,6 +79,56 @@ function offsetLabel(code){
   const m=String(code||"").match(/^(\d+)m$/);if(m)return `${m[1]} min`;
   return code;
 }
+// SHARE-DONE-V2 — avertit les autres membres quand un paiement ou RDV vient d'être terminé
+async function notifyNewPaidItems(env,me,oldData,newData){
+  try{
+    const oldBills=new Map((oldData?.bills||[]).map(b=>[String(b.id),b]));
+    const members=await env.DB.prepare("SELECT id FROM members WHERE family_id=? AND id<>?").bind(me.family_id,me.id).all();
+    const recipientIds=(members.results||[]).map(x=>x.id).filter(Boolean);
+    if(!recipientIds.length)return;
+
+    for(const b of (newData?.bills||[])){
+      if(!b?.id)continue;
+      const oldBill=oldBills.get(String(b.id));
+      const newStatuses=b.statuses||{};
+      const oldStatuses=oldBill?.statuses||{};
+
+      for(const [due,newSt] of Object.entries(newStatuses)){
+        if(!newSt?.paidAt||oldStatuses?.[due]?.paidAt)continue;
+
+        // Sécurité : ne pas notifier pour un ancien paiement simplement resynchronisé.
+        const paidTs=Date.parse(newSt.paidAt);
+        if(!Number.isFinite(paidTs)||Math.abs(Date.now()-paidTs)>30*60*1000)continue;
+
+        const paidByRaw=String(newSt.paidBy||"").trim();
+        const who=(paidByRaw&&!/^moi$/i.test(paidByRaw))?paidByRaw:String(me.name||"Quelqu’un");
+        const name=String(b.name||(isAppointment(b)?"un rendez-vous":"un paiement")).slice(0,100);
+
+        if(isAppointment(b)){
+          const bits=[];
+          if(b.eventTime)bits.push(String(b.eventTime).slice(0,5));
+          if(b.location)bits.push(String(b.location).slice(0,80));
+          const extra=bits.length?` · ${bits.join(" · ")}`:"";
+          const message=`${who} a marqué ${name} comme terminé ✅${extra}`;
+          const key=`${me.family_id}:rdv-done-share:${b.id}:${due}:${newSt.paidAt}`;
+          await logOnce(env,me.family_id,key,()=>sendPush(env,recipientIds,"Rendez-vous terminé ✅",message,env.APP_URL||"/"));
+          continue;
+        }
+
+        const amount=Number(newSt.paidAmount??b.amount??0);
+        const amountText=Number.isFinite(amount)
+          ? new Intl.NumberFormat("fr-CA",{minimumFractionDigits:2,maximumFractionDigits:2}).format(amount)+" $"
+          : "";
+        const message=`${who} a payé ${name}${amountText?` · ${amountText}`:""}`;
+        const key=`${me.family_id}:paid-share:${b.id}:${due}:${newSt.paidAt}`;
+        await logOnce(env,me.family_id,key,()=>sendPush(env,recipientIds,"Paiement effectué ✅",message,env.APP_URL||"/"));
+      }
+    }
+  }catch(e){
+    console.warn("Paid share notification",e?.message||e);
+  }
+}
+
 async function processFamily(env,f){
   let data={};try{data=JSON.parse(f.data_json||"{}")}catch{return}
   const s=data.settings||{},p=localParts(f.timezone||s.timezone||"America/Toronto"),hour=Number(s.reminderHour??9),atReminderHour=p.hour===hour;
@@ -167,7 +217,11 @@ export default {
       if(path==="/api/state"&&req.method==="PUT"){
         const b=await req.json(),f=await env.DB.prepare("SELECT data_json,version FROM families WHERE id=?").bind(me.family_id).first();
         if(Number(b.version)!==Number(f.version))return json({error:"Conflit de synchronisation",data:JSON.parse(f.data_json||"{}"),version:f.version},409);
-        const v=Number(f.version)+1,t=now();await env.DB.prepare("UPDATE families SET data_json=?,version=?,updated_at=? WHERE id=?").bind(JSON.stringify(b.data||{}),v,t,me.family_id).run();return json({ok:true,version:v,updatedAt:t})
+        let oldData={};try{oldData=JSON.parse(f.data_json||"{}")}catch{}
+        const newData=b.data||{},v=Number(f.version)+1,t=now();
+        await env.DB.prepare("UPDATE families SET data_json=?,version=?,updated_at=? WHERE id=?").bind(JSON.stringify(newData),v,t,me.family_id).run();
+        await notifyNewPaidItems(env,me,oldData,newData);
+        return json({ok:true,version:v,updatedAt:t})
       }
       if(path==="/api/me"&&req.method==="GET")return json({memberId:me.id,memberName:me.name,familyId:me.family_id,joinCode:me.join_code});
       return json({error:"Route introuvable"},404)
