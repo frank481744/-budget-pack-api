@@ -1,218 +1,111 @@
-// BUDGET PACK API — CALENDAR V3 RDV + RAPPELS + SHARE DONE V2 (2026-10-31)
+// N'OUBLIE RIEN API V1 — partage + WIZZ + notifications de tâches terminées
 const json=(data,status=200,extra={})=>new Response(JSON.stringify(data),{status,headers:{"content-type":"application/json; charset=utf-8","access-control-allow-origin":"*",...extra}});
 const now=()=>new Date().toISOString();
 const rand=(n=24)=>{const a=new Uint8Array(n);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,"0")).join("")};
 const id=p=>`${p}_${rand(10)}`;
 const hash=async s=>[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)))].map(x=>x.toString(16).padStart(2,"0")).join("");
-const pad=n=>String(n).padStart(2,"0");
 const ONESIGNAL_APP_ID="4770a678-6329-4944-9d54-b01d0b14fc97";
 
 async function auth(req,env){
   const raw=(req.headers.get("authorization")||"").replace(/^Bearer\s+/i,"");if(!raw)return null;
-  const h=await hash(raw);return env.DB.prepare("SELECT m.*, f.join_code, f.timezone FROM members m JOIN families f ON f.id=m.family_id WHERE m.token_hash=?").bind(h).first()
-}
-function localParts(tz){
-  const parts=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit",weekday:"short",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(new Date());
-  const o={};parts.forEach(p=>o[p.type]=p.value);return {date:`${o.year}-${o.month}-${o.day}`,hour:Number(o.hour),minute:Number(o.minute),weekday:o.weekday}
-}
-const parseDate=s=>new Date(`${s}T12:00:00Z`);
-const iso=d=>`${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
-const addDays=(s,n)=>{const d=parseDate(s);d.setUTCDate(d.getUTCDate()+n);return iso(d)};
-const lastDay=(y,m)=>new Date(Date.UTC(y,m,0)).getUTCDate();
-const monthly=(y,m,day)=>`${y}-${pad(m)}-${pad(Math.min(Number(day||1),lastDay(y,m)))}`;
-function occurrences(b,from,to){
-  if(!b.active&& !b.endedAt)return [];let out=[];
-  if(b.frequency==="one"){if(b.dueDate>=from&&b.dueDate<=to)out=[b.dueDate]}
-  else if(b.frequency==="weekly"){let d=b.startDate||from;while(d<from)d=addDays(d,7);while(d<=to){out.push(d);d=addDays(d,7)}}
-  else {let d=parseDate(from),e=parseDate(to);d.setUTCDate(1);while(d<=e){const s=monthly(d.getUTCFullYear(),d.getUTCMonth()+1,b.dueDay);if(s>=from&&s<=to)out.push(s);d.setUTCMonth(d.getUTCMonth()+1)}}
-  if(b.endedAt)out=out.filter(x=>x<=b.endedAt);return out
+  const h=await hash(raw);
+  return env.DB.prepare("SELECT m.*, f.join_code, f.timezone FROM members m JOIN families f ON f.id=m.family_id WHERE m.token_hash=?").bind(h).first()
 }
 async function sendPush(env,memberIds,title,message,url="/"){
-  if(!env.ONESIGNAL_REST_API_KEY||!memberIds.length)return false;
-  const r=await fetch("https://api.onesignal.com/notifications",{method:"POST",headers:{"content-type":"application/json","authorization":`Key ${env.ONESIGNAL_REST_API_KEY}`},body:JSON.stringify({app_id:ONESIGNAL_APP_ID,include_aliases:{external_id:memberIds},target_channel:"push",headings:{fr:title,en:title},contents:{fr:message,en:message},url:env.APP_URL||url})});
+  const ids=[...new Set((memberIds||[]).map(String).filter(Boolean))];
+  if(!env.ONESIGNAL_REST_API_KEY||!ids.length)return false;
+  const r=await fetch("https://api.onesignal.com/notifications",{method:"POST",headers:{"content-type":"application/json","authorization":`Key ${env.ONESIGNAL_REST_API_KEY}`},body:JSON.stringify({app_id:ONESIGNAL_APP_ID,include_aliases:{external_id:ids},target_channel:"push",headings:{fr:title,en:title},contents:{fr:message,en:message},url:env.APP_URL||url})});
   if(!r.ok)console.warn("OneSignal",r.status,await r.text().catch(()=>""));
   return r.ok
 }
-async function sendPushFilters(env,filters,title,message,url){
+async function sendPushFilters(env,filters,title,message,url="/"){
   if(!env.ONESIGNAL_REST_API_KEY||!filters?.length)return false;
-  const r=await fetch("https://api.onesignal.com/notifications",{method:"POST",headers:{"content-type":"application/json","authorization":`Key ${env.ONESIGNAL_REST_API_KEY}`},body:JSON.stringify({app_id:ONESIGNAL_APP_ID,filters,target_channel:"push",headings:{fr:title,en:title},contents:{fr:message,en:message},url})});
+  const r=await fetch("https://api.onesignal.com/notifications",{method:"POST",headers:{"content-type":"application/json","authorization":`Key ${env.ONESIGNAL_REST_API_KEY}`},body:JSON.stringify({app_id:ONESIGNAL_APP_ID,filters,target_channel:"push",headings:{fr:title,en:title},contents:{fr:message,en:message},url:env.MISSION_APP_URL||url})});
   if(!r.ok)console.warn("OneSignal Mission Maison",r.status,await r.text().catch(()=>""));
   return r.ok
 }
+async function otherMemberIds(env,me,targetMemberId=""){
+  const all=await env.DB.prepare("SELECT id FROM members WHERE family_id=? AND id<>?").bind(me.family_id,me.id).all();
+  let ids=(all.results||[]).map(x=>String(x.id)).filter(Boolean);
+  if(targetMemberId)ids=ids.filter(x=>x===String(targetMemberId));
+  return ids
+}
 async function logOnce(env,familyId,key,fn){
-  const found=await env.DB.prepare("SELECT id FROM reminder_log WHERE reminder_key=?").bind(key).first();if(found)return;
-  const ok=await fn();if(ok)await env.DB.prepare("INSERT OR IGNORE INTO reminder_log(id,family_id,reminder_key,sent_at) VALUES(?,?,?,?)").bind(id("rem"),familyId,key,now()).run()
+  const found=await env.DB.prepare("SELECT id FROM reminder_log WHERE reminder_key=?").bind(key).first();if(found)return false;
+  const ok=await fn();if(ok)await env.DB.prepare("INSERT OR IGNORE INTO reminder_log(id,family_id,reminder_key,sent_at) VALUES(?,?,?,?)").bind(id("rem"),familyId,key,now()).run();
+  return !!ok
 }
-function isAppointment(b){
-  const c=String(b?.calendarKind||"").toLowerCase(),cat=String(b?.category||"").toLowerCase();
-  return c==="appointment"||cat==="rendez-vous"||cat==="rendez vous";
-}
-function reminderOffsetMinutes(code){
-  const v=String(code||"").trim().toLowerCase();
-  if(v==="1d")return 1440;
-  let m=v.match(/^(\d+)h$/);if(m)return Number(m[1])*60;
-  m=v.match(/^(\d+)m$/);if(m)return Number(m[1]);
-  return null;
-}
-function appointmentReminders(b,s){
-  if(Array.isArray(b?.reminderOffsets))return [...new Set(b.reminderOffsets.map(x=>String(x||"").toLowerCase()).filter(Boolean))];
-  return s.dayBeforeReminder===false?[]:["1d"];
-}
-function localMinutesUntil(p,due,time){
-  if(!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(time||"")))return null;
-  const current=Date.parse(`${p.date}T${pad(p.hour)}:${pad(p.minute)}:00Z`);
-  const event=Date.parse(`${due}T${time}:00Z`);
-  if(!Number.isFinite(current)||!Number.isFinite(event))return null;
-  return Math.round((event-current)/60000);
-}
-function appointmentMessage(b,due,prefix=""){
-  const bits=[];
-  if(b.eventTime)bits.push(String(b.eventTime).slice(0,5));
-  if(b.location)bits.push(String(b.location).slice(0,90));
-  if(b.note)bits.push(String(b.note).slice(0,140));
-  return `${prefix}${b.name}${bits.length?` · ${bits.join(" · ")}`:""}`;
-}
-function offsetLabel(code){
-  if(code==="2h")return "2 h";
-  if(code==="1h")return "1 h";
-  const h=String(code||"").match(/^(\d+)h$/);if(h)return `${h[1]} h`;
-  const m=String(code||"").match(/^(\d+)m$/);if(m)return `${m[1]} min`;
-  return code;
-}
-// SHARE-DONE-V2 — avertit les autres membres quand un paiement ou RDV vient d'être terminé
-async function notifyNewPaidItems(env,me,oldData,newData){
+function hubTasks(data){return Array.isArray(data?.familyHubV1?.tasks)?data.familyHubV1.tasks:[]}
+async function notifyNewTaskCompletions(env,me,oldData,newData){
   try{
-    const oldBills=new Map((oldData?.bills||[]).map(b=>[String(b.id),b]));
-    const members=await env.DB.prepare("SELECT id FROM members WHERE family_id=? AND id<>?").bind(me.family_id,me.id).all();
-    const recipientIds=(members.results||[]).map(x=>x.id).filter(Boolean);
-    if(!recipientIds.length)return;
-
-    for(const b of (newData?.bills||[])){
-      if(!b?.id)continue;
-      const oldBill=oldBills.get(String(b.id));
-      const newStatuses=b.statuses||{};
-      const oldStatuses=oldBill?.statuses||{};
-
-      for(const [due,newSt] of Object.entries(newStatuses)){
-        if(!newSt?.paidAt||oldStatuses?.[due]?.paidAt)continue;
-
-        // Sécurité : ne pas notifier pour un ancien paiement simplement resynchronisé.
-        const paidTs=Date.parse(newSt.paidAt);
-        if(!Number.isFinite(paidTs)||Math.abs(Date.now()-paidTs)>30*60*1000)continue;
-
-        const paidByRaw=String(newSt.paidBy||"").trim();
-        const who=(paidByRaw&&!/^moi$/i.test(paidByRaw))?paidByRaw:String(me.name||"Quelqu’un");
-        const name=String(b.name||(isAppointment(b)?"un rendez-vous":"un paiement")).slice(0,100);
-
-        if(isAppointment(b)){
-          const bits=[];
-          if(b.eventTime)bits.push(String(b.eventTime).slice(0,5));
-          if(b.location)bits.push(String(b.location).slice(0,80));
-          const extra=bits.length?` · ${bits.join(" · ")}`:"";
-          const message=`${who} a marqué ${name} comme terminé ✅${extra}`;
-          const key=`${me.family_id}:rdv-done-share:${b.id}:${due}:${newSt.paidAt}`;
-          await logOnce(env,me.family_id,key,()=>sendPush(env,recipientIds,"Rendez-vous terminé ✅",message,env.APP_URL||"/"));
-          continue;
-        }
-
-        const amount=Number(newSt.paidAmount??b.amount??0);
-        const amountText=Number.isFinite(amount)
-          ? new Intl.NumberFormat("fr-CA",{minimumFractionDigits:2,maximumFractionDigits:2}).format(amount)+" $"
-          : "";
-        const message=`${who} a payé ${name}${amountText?` · ${amountText}`:""}`;
-        const key=`${me.family_id}:paid-share:${b.id}:${due}:${newSt.paidAt}`;
-        await logOnce(env,me.family_id,key,()=>sendPush(env,recipientIds,"Paiement effectué ✅",message,env.APP_URL||"/"));
-      }
+    const oldMap=new Map(hubTasks(oldData).map(t=>[String(t.id),t]));
+    const recipients=await otherMemberIds(env,me);
+    if(!recipients.length)return;
+    for(const t of hubTasks(newData)){
+      if(!t?.id||!t.doneAt||t.deletedAt)continue;
+      const old=oldMap.get(String(t.id));
+      if(old?.doneAt)continue;
+      const doneTs=Date.parse(t.doneAt);if(!Number.isFinite(doneTs)||Math.abs(Date.now()-doneTs)>30*60*1000)continue;
+      const who=String(t.doneByName||me.name||"Quelqu’un").slice(0,60);
+      const title=String(t.title||"une tâche").slice(0,120);
+      const key=`${me.family_id}:hub-task-done:${t.id}:${t.doneAt}`;
+      await logOnce(env,me.family_id,key,()=>sendPush(env,recipients,"Tâche terminée ✅",`${who} a terminé « ${title} »`,env.APP_URL||"/"));
     }
-  }catch(e){
-    console.warn("Paid share notification",e?.message||e);
-  }
+  }catch(e){console.warn("Hub task completion",e?.message||e)}
 }
 
-async function processFamily(env,f){
-  let data={};try{data=JSON.parse(f.data_json||"{}")}catch{return}
-  const s=data.settings||{},p=localParts(f.timezone||s.timezone||"America/Toronto"),hour=Number(s.reminderHour??9),atReminderHour=p.hour===hour;
-  const members=await env.DB.prepare("SELECT id FROM members WHERE family_id=?").bind(f.id).all(), ids=(members.results||[]).map(x=>x.id);
-  const bills=(data.bills||[]).filter(b=>b.active!==false), from=addDays(p.date,-3650),to=addDays(p.date,8), items=[];
-  bills.forEach(b=>occurrences(b,from,to).forEach(due=>items.push({b,due,st:(b.statuses||{})[due]||{}})));
-
-  if(atReminderHour && s.sundayReminder!==false && p.weekday==="Sun"){
-    const upcoming=items.filter(x=>x.due>=p.date&&x.due<=addDays(p.date,7)&&!x.st.paidAt);
-    const payments=upcoming.filter(x=>!isAppointment(x.b)), appointments=upcoming.filter(x=>isAppointment(x.b));
-    if(upcoming.length){
-      const total=payments.reduce((a,x)=>a+Number(x.b.amount||0),0), parts=[];
-      if(payments.length)parts.push(`${payments.length} paiement(s) · ${total.toFixed(2)} $`);
-      if(appointments.length)parts.push(`${appointments.length} rendez-vous`);
-      const names=upcoming.slice(0,4).map(x=>x.b.name).join(", ");
-      await logOnce(env,f.id,`${f.id}:weekly:${p.date}`,()=>sendPush(env,ids,"BUDGET PACK · Semaine",`${parts.join(" · ")} · ${names}${upcoming.length>4?"…":""}`))
-    }
-  }
-
-  for(const x of items){
-    if(x.st.paidAt)continue;
-    if(x.st.snoozedUntil && x.st.snoozedUntil>p.date)continue;
-
-    if(isAppointment(x.b)){
-      const reminders=appointmentReminders(x.b,s);
-      if(atReminderHour && reminders.includes("1d") && x.due===addDays(p.date,1)){
-        await logOnce(env,f.id,`${f.id}:rdv:1d:${x.b.id}:${x.due}`,()=>sendPush(env,ids,"Rendez-vous demain",appointmentMessage(x.b,x.due,"📅 ")))
-      }
-      if(x.b.eventTime){
-        const diff=localMinutesUntil(p,x.due,x.b.eventTime);
-        for(const code of reminders){
-          if(code==="1d")continue;
-          const offset=reminderOffsetMinutes(code);if(offset==null||offset<=0||diff==null)continue;
-          // Le cron existant est horaire : cette fenêtre envoie une fois, au passage le plus proche avant le rappel demandé.
-          if(diff>=offset && diff<offset+60){
-            await logOnce(env,f.id,`${f.id}:rdv:${code}:${x.b.id}:${x.due}`,()=>sendPush(env,ids,`Rendez-vous dans ~${offsetLabel(code)}`,appointmentMessage(x.b,x.due,"📅 ")))
-          }
-        }
-      }
-      continue;
-    }
-
-    if(atReminderHour && s.dayBeforeReminder!==false && x.due===addDays(p.date,1)){
-      await logOnce(env,f.id,`${f.id}:tomorrow:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement demain",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ demain.`))
-    }
-    if(atReminderHour && s.lateReminder!==false && x.due<p.date){
-      await logOnce(env,f.id,`${f.id}:late:${x.b.id}:${x.due}:${p.date}`,()=>sendPush(env,ids,"Paiement en retard",`${x.b.name} · ${Number(x.b.amount||0).toFixed(2)} $ n'est pas marqué payé.`,env.APP_URL||"/"))
-    }
-  }
-}
 export default {
   async fetch(req,env){
     if(req.method==="OPTIONS")return new Response(null,{headers:{"access-control-allow-origin":"*","access-control-allow-headers":"authorization,content-type","access-control-allow-methods":"GET,POST,PUT,OPTIONS"}});
     const u=new URL(req.url),path=u.pathname;
     try{
-      if(path==="/api/health")return json({ok:true,time:now()});
+      if(path==="/"||path==="/api/health")return json({ok:true,service:"N'OUBLIE RIEN API",time:now()});
       if(path==="/api/push-config"&&req.method==="GET")return json({appId:ONESIGNAL_APP_ID});
+
       if(path==="/api/family/create"&&req.method==="POST"){
         const b=await req.json(),familyId=id("fam"),memberId=id("mem"),token=rand(24),joinCode=Math.random().toString(36).slice(2,8).toUpperCase(),t=now();
         await env.DB.batch([
-          env.DB.prepare("INSERT INTO families(id,name,join_code,timezone,data_json,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").bind(familyId,b.familyName||"Budget familial",joinCode,b.timezone||"America/Toronto","{}",0,t,t),
+          env.DB.prepare("INSERT INTO families(id,name,join_code,timezone,data_json,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)").bind(familyId,b.familyName||"N'OUBLIE RIEN",joinCode,b.timezone||"America/Toronto","{}",0,t,t),
           env.DB.prepare("INSERT INTO members(id,family_id,name,role,token_hash,created_at) VALUES(?,?,?,?,?,?)").bind(memberId,familyId,b.memberName||"Moi","owner",await hash(token),t)
         ]);
         return json({familyId,memberId,token,joinCode,version:0})
       }
       if(path==="/api/family/join"&&req.method==="POST"){
-        const b=await req.json(),f=await env.DB.prepare("SELECT * FROM families WHERE join_code=?").bind(String(b.joinCode||"").toUpperCase()).first();if(!f)return json({error:"Code famille introuvable"},404);
-        const memberId=id("mem"),token=rand(24);await env.DB.prepare("INSERT INTO members(id,family_id,name,role,token_hash,created_at) VALUES(?,?,?,?,?,?)").bind(memberId,f.id,b.memberName||"Membre","member",await hash(token),now()).run();
+        const b=await req.json(),f=await env.DB.prepare("SELECT * FROM families WHERE join_code=?").bind(String(b.joinCode||"").trim().toUpperCase()).first();
+        if(!f)return json({error:"Code famille introuvable"},404);
+        const memberId=id("mem"),token=rand(24);
+        await env.DB.prepare("INSERT INTO members(id,family_id,name,role,token_hash,created_at) VALUES(?,?,?,?,?,?)").bind(memberId,f.id,b.memberName||"Membre","member",await hash(token),now()).run();
         return json({familyId:f.id,memberId,token,joinCode:f.join_code})
       }
+
       const me=await auth(req,env);if(!me)return json({error:"Non autorisé"},401);
+
+      // Conservé tel quel pour Mission Maison qui utilise déjà ce Worker.
       if(path==="/api/mission/task-finished"&&req.method==="POST"){
         const b=await req.json();
-        const childName=String(b.childName||"Un enfant").slice(0,60);
-        const taskTitle=String(b.taskTitle||"une mission").slice(0,120);
+        const childName=String(b.childName||"Un enfant").slice(0,60),taskTitle=String(b.taskTitle||"une mission").slice(0,120);
         const filters=[
           {field:"tag",key:"mission_family",relation:"=",value:String(me.family_id)},
           {field:"tag",key:"mission_parent",relation:"=",value:"1"}
         ];
-        const ok=await sendPushFilters(env,filters,"MISSION MAISON",`${childName} a terminé « ${taskTitle} » ✅`,env.MISSION_APP_URL||"https://frank481744.github.io/mission-maison/");
+        const ok=await sendPushFilters(env,filters,"MISSION MAISON",`${childName} a terminé « ${taskTitle} » ✅`,env.MISSION_APP_URL||"/");
         return json({ok:true,sent:ok})
       }
+
+      if(path==="/api/members"&&req.method==="GET"){
+        const rows=await env.DB.prepare("SELECT id,name,role FROM members WHERE family_id=? ORDER BY created_at ASC").bind(me.family_id).all();
+        return json({members:rows.results||[]})
+      }
+      if(path==="/api/wizz"&&req.method==="POST"){
+        const b=await req.json(),target=String(b.targetMemberId||""),recipients=await otherMemberIds(env,me,target);
+        const title=String(b.title||`⚡ WIZZ de ${me.name||"quelqu’un"}`).slice(0,80);
+        const message=String(b.message||"Petit rappel ⚡").slice(0,220);
+        const sent=await sendPush(env,recipients,title,message,env.APP_URL||"/");
+        return json({ok:true,sent,recipients:recipients.length})
+      }
       if(path==="/api/state"&&req.method==="GET"){
-        const f=await env.DB.prepare("SELECT data_json,version,updated_at FROM families WHERE id=?").bind(me.family_id).first();return json({data:JSON.parse(f.data_json||"{}"),version:f.version,updatedAt:f.updated_at,joinCode:me.join_code})
+        const f=await env.DB.prepare("SELECT data_json,version,updated_at FROM families WHERE id=?").bind(me.family_id).first();
+        return json({data:JSON.parse(f.data_json||"{}"),version:f.version,updatedAt:f.updated_at,joinCode:me.join_code})
       }
       if(path==="/api/state"&&req.method==="PUT"){
         const b=await req.json(),f=await env.DB.prepare("SELECT data_json,version FROM families WHERE id=?").bind(me.family_id).first();
@@ -220,15 +113,13 @@ export default {
         let oldData={};try{oldData=JSON.parse(f.data_json||"{}")}catch{}
         const newData=b.data||{},v=Number(f.version)+1,t=now();
         await env.DB.prepare("UPDATE families SET data_json=?,version=?,updated_at=? WHERE id=?").bind(JSON.stringify(newData),v,t,me.family_id).run();
-        await notifyNewPaidItems(env,me,oldData,newData);
+        await notifyNewTaskCompletions(env,me,oldData,newData);
         return json({ok:true,version:v,updatedAt:t})
       }
       if(path==="/api/me"&&req.method==="GET")return json({memberId:me.id,memberName:me.name,familyId:me.family_id,joinCode:me.join_code});
       return json({error:"Route introuvable"},404)
-    }catch(e){return json({error:e.message||"Erreur serveur"},500)}
+    }catch(e){return json({error:e?.message||"Erreur serveur"},500)}
   },
-  async scheduled(controller,env,ctx){
-    const fam=await env.DB.prepare("SELECT * FROM families").all();
-    for(const f of fam.results||[])ctx.waitUntil(processFamily(env,f))
-  }
+  // Aucun rappel automatique pour les jobs ou les listes. Le WIZZ est volontaire.
+  async scheduled(){return}
 };
